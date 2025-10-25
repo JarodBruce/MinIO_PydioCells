@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pydio-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: pydio-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pydio-pvc
+  namespace: pydio-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: pydio-system
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "rootpassword"
+        - name: MYSQL_DATABASE
+          value: "cells"
+        - name: MYSQL_USER
+          value: "pydio"
+        - name: MYSQL_PASSWORD
+          value: "pydiopass"
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 250m
+          limits:
+            memory: 1Gi
+            cpu: 500m
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: pydio-system
+spec:
+  selector:
+    app: mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pydio-cells
+  namespace: pydio-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pydio-cells
+  template:
+    metadata:
+      labels:
+        app: pydio-cells
+    spec:
+      initContainers:
+      - name: wait-for-mysql
+        image: busybox:1.35
+        command: 
+        - 'sh'
+        - '-c'
+        - |
+          until nc -z mysql.pydio-system.svc.cluster.local 3306; do
+            echo "Waiting for MySQL..."
+            sleep 5
+          done
+          echo "MySQL is ready!"
+      containers:
+      - name: pydio-cells
+        image: pydio/cells:latest
+        env:
+        - name: CELLS_BIND
+          value: "0.0.0.0:8080"
+        - name: CELLS_EXTERNAL
+          value: "http://localhost:8080"
+        - name: CELLS_NO_TLS
+          value: "1"
+        ports:
+        - containerPort: 8080
+          name: web
+        volumeMounts:
+        - name: pydio-storage
+          mountPath: /var/cells
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 250m
+          limits:
+            memory: 1Gi
+            cpu: 500m
+      volumes:
+      - name: pydio-storage
+        persistentVolumeClaim:
+          claimName: pydio-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pydio-cells
+  namespace: pydio-system
+spec:
+  selector:
+    app: pydio-cells
+  type: NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30808

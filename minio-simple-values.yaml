@@ -1,0 +1,41 @@
+# Simplified MinIO configuration for K3s
+mode: standalone
+
+replicas: 1
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClass: "local-path"
+
+service:
+  type: NodePort
+  port: 9000
+  nodePort: 30900
+  consolePort: 9001
+  consoleNodePort: 30901
+
+ingress:
+  enabled: false
+
+rootUser: "minioadmin"
+rootPassword: "minioadmin123"
+
+# Post jobを無効化
+postJob:
+  podAnnotations:
+    helm.sh/hook: post-install,post-upgrade
+  serviceAccount:
+    create: false
+
+buckets: []
+users: []
+policies: []
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    memory: 1Gi
+    cpu: 500m

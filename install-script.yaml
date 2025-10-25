@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: install-commands
+  namespace: default
+data:
+  install.sh: |
+    #!/bin/bash
+    
+    # MinIO Helmレポジトリの追加
+    helm repo add minio https://charts.min.io/
+    helm repo update
+    
+    # MinIOのインストール
+    helm install minio minio/minio \
+      --namespace default \
+      --values minio-values.yaml \
+      --create-namespace \
+      --wait
+    
+    # Pydio Cellsのデプロイ
+    kubectl apply -f pydio-cells-deployment.yaml
+    
+    # デプロイメント状態の確認
+    kubectl wait --for=condition=available --timeout=600s \
+      deployment/pydio-cells -n pydio-system
+    
+    # サービスのエンドポイント確認
+    echo "MinIO Console: http://minio-console.local"
+    echo "MinIO API: http://minio.local"
+    echo "Pydio Cells: https://pydio.local"

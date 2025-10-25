@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: pydio-system
+
+resources:
+  - pydio-cells-deployment.yaml
+
+configMapGenerator:
+  - name: pydio-env
+    literals:
+      - CELLS_BIND=0.0.0.0:8080
+      - CELLS_EXTERNAL=https://pydio.local
+      - CELLS_NO_TLS=1
+
+secretGenerator:
+  - name: pydio-secrets
+    literals:
+      - mysql-root-password=root_password
+      - mysql-password=pydio_password
+      - minio-access-key=pydio-access-key
+      - minio-secret-key=pydio-secret-key-change-me
