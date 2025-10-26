@@ -15,60 +15,11 @@
 apiVersion: v1
 kind: Secret
 metadata:
-  name: cloudflared-credentials
+  name: cloudflared-token
   namespace: cells
 type: Opaque
 stringData:
-  # Cloudflare Tunnelの認証情報（実際の値に置き換える）
-  credentials.json: |
-    {
-      "AccountTag": "your-account-id",
-      "TunnelSecret": "your-tunnel-secret",
-      "TunnelID": "your-tunnel-id"
-    }
-
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cloudflared-config
-  namespace: cells
-data:
-  config.yaml: |
-    tunnel: your-tunnel-id
-    credentials-file: /etc/cloudflared/credentials.json
-    
-    # ログ設定
-    loglevel: info
-    
-    # Ingress Rules
-    ingress:
-      # Pydio Cells メインアプリケーション
-      - hostname: cells.yourdomain.com
-        service: http://pydio-cells.cells.svc.cluster.local:8080
-        originRequest:
-          noTLSVerify: true
-          connectTimeout: 30s
-          httpHostHeader: cells.yourdomain.com
-      
-      # MinIO Console（オプション - 管理用）
-      - hostname: minio.yourdomain.com
-        service: http://minio.cells.svc.cluster.local:9001
-        originRequest:
-          noTLSVerify: true
-          connectTimeout: 30s
-          httpHostHeader: minio.yourdomain.com
-      
-      # MinIO API（ファイルアップロード用）
-      - hostname: s3.yourdomain.com
-        service: http://minio.cells.svc.cluster.local:9000
-        originRequest:
-          noTLSVerify: true
-          connectTimeout: 60s
-          httpHostHeader: s3.yourdomain.com
-      
-      # Catch-all rule
-      - service: http_status:404
+  token: "eyJhIjoiODQ2ZWFmZDUzNDI1M2Q1M2Q2ZTZiNzRhOWU3MTdiN2EiLCJ0IjoiMGE3N2EwZmYtNDcyMC00ZDhlLWI1MTgtMmU4NTdmOGQzOTM4IiwicyI6Ik5EUTBNV1V3TURVdE56YzVZaTAwTXpjMkxUaGxOV0V0WW1NMlltTmxNakJtTW1ZMiJ9"
 
 ---
 apiVersion: apps/v1
@@ -88,21 +39,33 @@ spec:
       labels:
         app: cloudflared
     spec:
+      # ホストのネットワークスタックを使用（IPv6対応）
+      hostNetwork: true
+      # ホストのDNSを使用
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: cloudflared
         image: cloudflare/cloudflared:latest
         args:
         - tunnel
-        - --config
-        - /etc/cloudflared/config.yaml
+        - --no-autoupdate
+        - --edge-ip-version
+        - "6"  # IPv6のみ使用
+        - --protocol
+        - quic  # QUICプロトコルでIPv6を最大限活用
         - run
-        volumeMounts:
-        - name: config
-          mountPath: /etc/cloudflared
-          readOnly: true
-        - name: credentials
-          mountPath: /etc/cloudflared
-          readOnly: true
+        - --token
+        - $(TUNNEL_TOKEN)
+        env:
+        - name: TUNNEL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflared-token
+              key: token
+        - name: TUNNEL_TRANSPORT_PROTOCOL
+          value: "quic"
+        - name: TUNNEL_EDGE_IP_VERSION
+          value: "auto"
         resources:
           requests:
             memory: 128Mi
@@ -110,18 +73,31 @@ spec:
           limits:
             memory: 256Mi
             cpu: 200m
-      volumes:
-      - name: config
-        configMap:
-          name: cloudflared-config
-      - name: credentials
-        secret:
-          secretName: cloudflared-credentials
 
 ---
 # ============================================
 # セットアップ手順
 # ============================================
+
+# 【IPv6優先通信の設定】
+# このconfigではCloudflareとの通信をIPv6優先にしています。
+# IPoE (IPv6)接続の高速性を活用できます。
+#
+# --edge-ip-version オプション:
+#   - auto: IPv6優先、フォールバックでIPv4（推奨）
+#   - 6: IPv6のみ（IPv6接続が確実な場合）
+#   - 4: IPv4のみ
+#   - auto-no-ipv4: IPv6のみ、IPv4フォールバックなし
+#
+# --protocol オプション:
+#   - quic: 最新のQUICプロトコル（UDP based, IPv6で最適）
+#   - http2: 従来のHTTP/2
+#   - h2mux: レガシープロトコル
+#
+# 環境に応じた調整:
+# 1. 完全IPv6環境: --edge-ip-version を "6" に変更
+# 2. IPv4も必要: "auto" のまま（デフォルト）
+# 3. 接続が不安定: --protocol を "http2" に変更
 
 # 1. Cloudflare Tunnelの作成
 #    cloudflared tunnel create pydio-cells
@@ -149,6 +125,11 @@ spec:
 # 7. 再デプロイ
 #    kubectl apply -f cells-complete.yaml
 #    kubectl rollout restart deployment/pydio-cells -n cells
+#
+# 8. IPv6接続の確認
+#    kubectl logs -n cells deployment/cloudflared
+#    # ログに "Connection ... registered with protocol: quic" と表示されることを確認
+#    # IPv6アドレスが使用されていることを確認
 
 ---
 # ============================================
