@@ -1,0 +1,173 @@
+# ============================================
+# Cloudflare Tunnel Configuration
+# Pydio Cells外部公開用
+# ============================================
+
+# このファイルはCloudflare Tunnelを使用してPydio Cellsを
+# インターネットに公開する際の設定例です
+
+# 前提条件:
+# 1. Cloudflareアカウントとドメイン
+# 2. cloudflaredのインストール
+# 3. Cloudflare Tunnel作成済み
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflared-credentials
+  namespace: cells
+type: Opaque
+stringData:
+  # Cloudflare Tunnelの認証情報（実際の値に置き換える）
+  credentials.json: |
+    {
+      "AccountTag": "your-account-id",
+      "TunnelSecret": "your-tunnel-secret",
+      "TunnelID": "your-tunnel-id"
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: cells
+data:
+  config.yaml: |
+    tunnel: your-tunnel-id
+    credentials-file: /etc/cloudflared/credentials.json
+    
+    # ログ設定
+    loglevel: info
+    
+    # Ingress Rules
+    ingress:
+      # Pydio Cells メインアプリケーション
+      - hostname: cells.yourdomain.com
+        service: http://pydio-cells.cells.svc.cluster.local:8080
+        originRequest:
+          noTLSVerify: true
+          connectTimeout: 30s
+          httpHostHeader: cells.yourdomain.com
+      
+      # MinIO Console（オプション - 管理用）
+      - hostname: minio.yourdomain.com
+        service: http://minio.cells.svc.cluster.local:9001
+        originRequest:
+          noTLSVerify: true
+          connectTimeout: 30s
+          httpHostHeader: minio.yourdomain.com
+      
+      # MinIO API（ファイルアップロード用）
+      - hostname: s3.yourdomain.com
+        service: http://minio.cells.svc.cluster.local:9000
+        originRequest:
+          noTLSVerify: true
+          connectTimeout: 60s
+          httpHostHeader: s3.yourdomain.com
+      
+      # Catch-all rule
+      - service: http_status:404
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cells
+  labels:
+    app: cloudflared
+spec:
+  replicas: 2  # 冗長性のため2つ
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+        - tunnel
+        - --config
+        - /etc/cloudflared/config.yaml
+        - run
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloudflared
+          readOnly: true
+        - name: credentials
+          mountPath: /etc/cloudflared
+          readOnly: true
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 100m
+          limits:
+            memory: 256Mi
+            cpu: 200m
+      volumes:
+      - name: config
+        configMap:
+          name: cloudflared-config
+      - name: credentials
+        secret:
+          secretName: cloudflared-credentials
+
+---
+# ============================================
+# セットアップ手順
+# ============================================
+
+# 1. Cloudflare Tunnelの作成
+#    cloudflared tunnel create pydio-cells
+#
+# 2. Tunnel IDとCredentialsの取得
+#    cat ~/.cloudflared/<tunnel-id>.json
+#
+# 3. このファイルの編集
+#    - credentials.jsonの内容を実際の値に置き換え
+#    - config.yamlのtunnel IDを実際の値に置き換え
+#    - hostnameを実際のドメインに置き換え
+#
+# 4. Cloudflare DNSレコードの設定
+#    cells.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#    minio.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#    s3.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#
+# 5. デプロイ
+#    kubectl apply -f cloudflare-tunnel-config.yaml
+#
+# 6. Pydio Cellsの設定更新
+#    cells-complete.yamlの以下を変更:
+#    CELLS_EXTERNAL: "https://cells.yourdomain.com"
+#
+# 7. 再デプロイ
+#    kubectl apply -f cells-complete.yaml
+#    kubectl rollout restart deployment/pydio-cells -n cells
+
+---
+# ============================================
+# セキュリティ強化（本番環境推奨）
+# ============================================
+
+# 1. 全てのパスワード・シークレットを変更
+#    - minio-credentials
+#    - mysql-credentials
+#    - cloudflared-credentials
+#
+# 2. Cloudflare Access（Zero Trust）の有効化
+#    https://developers.cloudflare.com/cloudflare-one/
+#
+# 3. WAF（Web Application Firewall）ルールの設定
+#
+# 4. Rate Limitingの設定
+#
+# 5. SSL/TLS設定の最適化
+#    - Full (strict) SSLモード
+#    - Minimum TLS Version: 1.2+
+#    - HSTS有効化

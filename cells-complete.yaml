@@ -1,0 +1,627 @@
+---
+# ============================================
+# Pydio Cells + MinIO 統合デプロイメント
+# 単一namespace構成、内部DNS通信、Cloudflare Tunnels対応
+# ============================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cells
+  labels:
+    app: pydio-cells
+
+---
+# ============================================
+# MinIO - オブジェクトストレージ
+# ============================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-storage
+  namespace: cells
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: cells
+type: Opaque
+stringData:
+  root-user: "minioadmin"
+  root-password: "minioadmin123"
+  # Pydio Cells用のアクセスキー
+  access-key: "pydio-access-key"
+  secret-key: "pydio-secret-key-change-me-in-production"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-init-script
+  namespace: cells
+data:
+  init.sh: |
+    #!/bin/sh
+    set -e
+    
+    echo "Waiting for MinIO to be ready..."
+    until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+      echo "Waiting for MinIO..."
+      sleep 2
+    done
+    
+    echo "Creating pydio-data bucket..."
+    mc mb --ignore-existing local/pydio-data
+    
+    echo "Creating service account for Pydio Cells..."
+    mc admin user add local pydio-access-key pydio-secret-key-change-me-in-production || true
+    
+    echo "Setting policy..."
+    mc admin policy attach local readwrite --user pydio-access-key || true
+    
+    echo "MinIO initialization completed!"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: cells
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:latest
+        args:
+        - server
+        - /data
+        - --console-address
+        - ":9001"
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: root-user
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: root-password
+        - name: MINIO_BROWSER_REDIRECT_URL
+          value: "http://minio-console.cells.svc.cluster.local:9001"
+        ports:
+        - containerPort: 9000
+          name: api
+          protocol: TCP
+        - containerPort: 9001
+          name: console
+          protocol: TCP
+        volumeMounts:
+        - name: storage
+          mountPath: /data
+        livenessProbe:
+          httpGet:
+            path: /minio/health/live
+            port: 9000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 250m
+          limits:
+            memory: 2Gi
+            cpu: 1000m
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: minio-storage
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: cells
+  labels:
+    app: minio
+spec:
+  type: ClusterIP
+  selector:
+    app: minio
+  ports:
+  - port: 9000
+    targetPort: 9000
+    name: api
+    protocol: TCP
+  - port: 9001
+    targetPort: 9001
+    name: console
+    protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-console
+  namespace: cells
+  labels:
+    app: minio
+spec:
+  type: NodePort
+  selector:
+    app: minio
+  ports:
+  - port: 9001
+    targetPort: 9001
+    nodePort: 30901
+    name: console
+    protocol: TCP
+
+---
+# MinIO初期化Job（バケット作成など）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: cells
+spec:
+  ttlSecondsAfterFinished: 100
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: minio-init
+        image: minio/mc:latest
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: root-user
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: root-password
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Waiting for MinIO to be ready..."
+          until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+            echo "Waiting for MinIO..."
+            sleep 2
+          done
+          
+          echo "Creating pydio-data bucket..."
+          mc mb --ignore-existing local/pydio-data
+          
+          echo "Setting bucket to private..."
+          mc anonymous set none local/pydio-data || true
+          
+          echo "MinIO initialization completed!"
+
+---
+# ============================================
+# MySQL - データベース
+# ============================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-storage
+  namespace: cells
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: cells
+type: Opaque
+stringData:
+  root-password: "cells-root-password-change-me"
+  database: "cells"
+  username: "cells"
+  password: "cells-db-password-change-me"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: cells
+data:
+  my.cnf: |
+    [mysqld]
+    character-set-server=utf8mb4
+    collation-server=utf8mb4_unicode_ci
+    max_connections=200
+    max_allowed_packet=256M
+    innodb_buffer_pool_size=512M
+    innodb_log_file_size=128M
+    innodb_flush_log_at_trx_commit=2
+    innodb_flush_method=O_DIRECT
+    sql_mode=''
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: cells
+  labels:
+    app: mysql
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: root-password
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: database
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: username
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: password
+        args:
+        - "--character-set-server=utf8mb4"
+        - "--collation-server=utf8mb4_unicode_ci"
+        - "--max-allowed-packet=256M"
+        - "--innodb-buffer-pool-size=512M"
+        ports:
+        - containerPort: 3306
+          name: mysql
+          protocol: TCP
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        - name: config
+          mountPath: /etc/mysql/conf.d
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 500m
+          limits:
+            memory: 2Gi
+            cpu: 1000m
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-storage
+      - name: config
+        configMap:
+          name: mysql-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: cells
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+    name: mysql
+    protocol: TCP
+
+---
+# ============================================
+# Pydio Cells - アプリケーション
+# ============================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cells-data
+  namespace: cells
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cells-config
+  namespace: cells
+data:
+  # Pydio Cells設定
+  CELLS_BIND: "0.0.0.0:8080"
+  CELLS_EXTERNAL: "http://cells.local"
+  CELLS_NO_TLS: "1"
+  CELLS_WORKING_DIR: "/var/cells"
+  CELLS_LOG_LEVEL: "info"
+  # MySQL接続情報（内部DNS使用）
+  CELLS_DB_DSN: "cells:cells-db-password-change-me@tcp(mysql.cells.svc.cluster.local:3306)/cells?charset=utf8mb4&parseTime=true"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pydio-cells
+  namespace: cells
+  labels:
+    app: pydio-cells
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pydio-cells
+  template:
+    metadata:
+      labels:
+        app: pydio-cells
+    spec:
+      initContainers:
+      # MySQL待機
+      - name: wait-for-mysql
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for MySQL..."
+          until nc -z mysql.cells.svc.cluster.local 3306; do
+            echo "MySQL is not ready yet..."
+            sleep 3
+          done
+          echo "MySQL is ready!"
+      
+      # MinIO待機
+      - name: wait-for-minio
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for MinIO..."
+          until nc -z minio.cells.svc.cluster.local 9000; do
+            echo "MinIO is not ready yet..."
+            sleep 3
+          done
+          echo "MinIO is ready!"
+      
+      containers:
+      - name: pydio-cells
+        image: pydio/cells:latest
+        env:
+        - name: CELLS_BIND
+          valueFrom:
+            configMapKeyRef:
+              name: cells-config
+              key: CELLS_BIND
+        - name: CELLS_EXTERNAL
+          valueFrom:
+            configMapKeyRef:
+              name: cells-config
+              key: CELLS_EXTERNAL
+        - name: CELLS_NO_TLS
+          valueFrom:
+            configMapKeyRef:
+              name: cells-config
+              key: CELLS_NO_TLS
+        - name: CELLS_WORKING_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: cells-config
+              key: CELLS_WORKING_DIR
+        - name: CELLS_LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: cells-config
+              key: CELLS_LOG_LEVEL
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - name: cells-data
+          mountPath: /var/cells
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 500m
+          limits:
+            memory: 4Gi
+            cpu: 2000m
+      volumes:
+      - name: cells-data
+        persistentVolumeClaim:
+          claimName: cells-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pydio-cells
+  namespace: cells
+  labels:
+    app: pydio-cells
+spec:
+  type: ClusterIP
+  selector:
+    app: pydio-cells
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+    protocol: TCP
+
+---
+# NodePort for local development access
+apiVersion: v1
+kind: Service
+metadata:
+  name: pydio-cells-nodeport
+  namespace: cells
+  labels:
+    app: pydio-cells
+spec:
+  type: NodePort
+  selector:
+    app: pydio-cells
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30808
+    name: http
+    protocol: TCP
+
+---
+# ============================================
+# Ingress（Traefik用）- 将来のCloudflare Tunnels対応
+# ============================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pydio-cells-ingress
+  namespace: cells
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+  - host: cells.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: pydio-cells
+            port:
+              number: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-console-ingress
+  namespace: cells
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+  - host: minio-console.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: minio
+            port:
+              number: 9001
